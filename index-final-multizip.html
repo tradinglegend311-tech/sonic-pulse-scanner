@@ -124,9 +124,9 @@ capBtn.style.background='#0f766e';
 capBtn.onclick=async()=>{
   if(!symbols.length){statusEl.textContent='NIFTY 500 list is still loading…';return;}
   capBtn.disabled=true;
-  statusEl.textContent='Fetching current market caps automatically…';
+  statusEl.textContent='Fetching official NSE market-cap data…';
   try{
-    const caps=await quoteCaps(symbols);
+    const caps=await quoteCaps(symbols, Object.keys(history).sort().at(-1));
     if(Object.keys(caps).length<450) throw Error('Incomplete market-cap response');
     const lines=['Symbol,MarketCapCr'];
     for(const s of symbols){
@@ -141,7 +141,7 @@ capBtn.onclick=async()=>{
     statusEl.textContent=`Market Cap CSV ready • ${lines.length-1} stocks`;
   }catch(err){
     console.error(err);
-    statusEl.textContent='Automatic market-cap source unavailable. Scan can still use previously cached caps.';
+    statusEl.textContent='NSE market-cap data could not be fetched. Try again; cached market caps will be used if available.';
   }finally{capBtn.disabled=false;}
 };
 document.querySelector('.bar').appendChild(capBtn);
@@ -249,42 +249,85 @@ async function loadUniverse(){
   renderHistoryStatus();
 }
 
-async function quoteCaps(list){
-  // Automatic market-cap source: TradingView's public India scanner.
-  // It returns market_cap_basic for NSE-listed securities in one/batched request,
-  // so the user does not need to download or upload a separate market-cap CSV.
+async function quoteCaps(list, tradeDate){
+  // Official NSE daily Market Capitalisation (MCAP) report.
+  // The MCAP report is part of NSE's daily PR bundle and contains Symbol + Market Cap(Rs.).
+  // We try the direct CSV first, then a CORS-friendly text proxy, then the PR ZIP.
   const wanted=new Set(list.map(x=>String(x).toUpperCase()));
   const out={};
-  const endpoints=[
-    'https://scanner.tradingview.com/india/scan',
-    'https://scanner.tradingview.com/global/scan'
-  ];
-  const payload={
-    filter:[{left:'exchange',operation:'equal',right:'NSE'}],
-    options:{lang:'en'},
-    symbols:{query:{types:[]},tickers:[]},
-    columns:['name','market_cap_basic'],
-    range:[0,5000]
-  };
-  for(const endpoint of endpoints){
-    try{
-      const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),cache:'no-store'});
-      if(!r.ok) continue;
-      const data=await r.json();
-      const arr=Array.isArray(data.data)?data.data:[];
-      for(const row of arr){
-        const ticker=String(row.s||'').toUpperCase();
-        const sym=ticker.startsWith('NSE:')?ticker.slice(4):ticker;
-        const vals=row.d||[];
-        const cap=Number(vals[1]);
-        if(wanted.has(sym) && Number.isFinite(cap) && cap>0) out[sym]=cap;
+  if(!tradeDate) return out;
+  const [year,month,day]=tradeDate.split('-');
+  const months=['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+  const mon=months[Number(month)-1];
+  const ddmmyyyy=`${day}${month}${year}`;
+  const ddmmyy=`${day}${month}${year.slice(2)}`;
+  const base=`https://nsearchives.nseindia.com/content/historical/EQUITIES/${year}/${mon}`;
+  const csvUrl=`${base}/mcap${ddmmyyyy}.csv`;
+
+  function parseCsv(text){
+    const lines=text.replace(/^\uFEFF/,'').split(/\r?\n/).filter(x=>x.trim());
+    if(!lines.length) return 0;
+    const rows=[];
+    let row=[],field='',quoted=false;
+    for(const ch of text.replace(/^\uFEFF/,'')){
+      if(ch==='"'){quoted=!quoted; continue;}
+      if(ch===',' && !quoted){row.push(field.trim());field='';continue;}
+      if((ch==='\n'||ch==='\r')&&!quoted){
+        if(ch==='\r') continue;
+        row.push(field.trim()); field=''; if(row.some(Boolean)) rows.push(row); row=[]; continue;
       }
-      if(Object.keys(out).length>=Math.min(450,list.length)) break;
-    }catch(e){ console.warn('Automatic market-cap source failed',endpoint,e); }
+      field+=ch;
+    }
+    if(field.length||row.length){row.push(field.trim());if(row.some(Boolean))rows.push(row);}
+    if(rows.length<2) return 0;
+    const head=rows[0].map(x=>x.toLowerCase().replace(/[()\.\-\/ ]/g,''));
+    const symI=head.findIndex(x=>x==='symbol');
+    const capI=head.findIndex(x=>x.includes('marketcap'));
+    if(symI<0||capI<0) return 0;
+    let count=0;
+    for(const r of rows.slice(1)){
+      const sym=String(r[symI]||'').toUpperCase().trim();
+      if(!wanted.has(sym)) continue;
+      const raw=String(r[capI]||'').replace(/,/g,'').trim();
+      const cap=Number(raw);
+      if(Number.isFinite(cap)&&cap>0){out[sym]=cap;count++;}
+    }
+    return count;
   }
+
+  async function tryText(url){
+    const r=await fetch(url,{cache:'no-store'});
+    if(!r.ok) throw Error(`HTTP ${r.status}`);
+    return await r.text();
+  }
+
+  const attempts=[
+    csvUrl,
+    `https://r.jina.ai/${csvUrl}`,
+    `https://r.jina.ai/http://nsearchives.nseindia.com/content/historical/EQUITIES/${year}/${mon}/mcap${ddmmyyyy}.csv`
+  ];
+  for(const url of attempts){
+    try{
+      const text=await tryText(url);
+      const n=parseCsv(text);
+      if(n>=Math.min(450,list.length)) return out;
+    }catch(e){console.warn('NSE MCAP CSV failed',url,e);}
+  }
+
+  // Last fallback: download the official NSE PR ZIP and extract mcapDDMMYYYY.csv.
+  try{
+    const r=await fetch(`${base}/PR${ddmmyy}.zip`,{cache:'no-store'});
+    if(r.ok){
+      const zip=await JSZip.loadAsync(await r.arrayBuffer());
+      const target=Object.keys(zip.files).find(n=>n.toLowerCase().endsWith(`/mcap${ddmmyyyy}.csv`)||n.toLowerCase()===`mcap${ddmmyyyy}.csv`);
+      if(target){
+        const text=await zip.files[target].async('text');
+        parseCsv(text);
+      }
+    }
+  }catch(e){console.warn('NSE PR ZIP MCAP fallback failed',e);}
   return out;
 }
-
 function rsi(values,n=9){
   if(values.length<n+1) return null;
   let gains=0,losses=0;
@@ -349,7 +392,7 @@ async function scan(){
   let caps=marketCaps.caps||{};
   const capAge=marketCaps.date ? (Date.now()-new Date(marketCaps.date).getTime()) : Infinity;
   if(capAge>20*60*60*1000 || Object.keys(caps).length<450){
-    const fresh=await quoteCaps(symbols);
+    const fresh=await quoteCaps(symbols, useDates.at(-1));
     if(Object.keys(fresh).length>=450){
       caps=fresh;
       marketCaps={date:new Date().toISOString(),caps};
