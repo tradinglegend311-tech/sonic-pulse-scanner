@@ -36,7 +36,7 @@ th{background:#f8fafc}
 <div class="wrap">
   <div class="bar">
     <label style="display:flex;align-items:center;gap:8px;padding:11px 14px;border:1px solid #dbe2ea;border-radius:10px;background:#fff;font-weight:700;font-size:12px">
-      📦 Today's BhavCopy ZIP
+      📦 NSE BhavCopy ZIP(s)
       <input id="bhavFile" type="file" accept=".zip,.csv" style="max-width:180px">
     </label>
     <button id="scan">Scan NIFTY 500</button>
@@ -44,7 +44,7 @@ th{background:#f8fafc}
   </div>
 
   <div id="status" class="status">Loading NIFTY 500 universe…</div>
-  <div class="small">Upload the latest NSE BhavCopy ZIP above before scanning. Historical data will be retained by the scanner in the browser.</div>
+  <div class="small">Upload one or more NSE BhavCopy ZIPs. The scanner keeps the newest 40 trading days in this browser, so tomorrow you can upload only the new day.</div>
 
   <div class="card">
     <div class="tablewrap">
@@ -75,207 +75,235 @@ th{background:#f8fafc}
   </p>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <script>
-const UNIVERSE_URL =
-  'https://raw.githubusercontent.com/sswapnil2-tech/tradingview-mcp-india/main/src/tradingview_mcp/coinlist/nse.txt';
+const UNIVERSE_URL='https://raw.githubusercontent.com/sswapnil2-tech/tradingview-mcp-india/main/src/tradingview_mcp/coinlist/nse.txt';
+const FALLBACK_UNIVERSE_URL='https://raw.githubusercontent.com/sswapnil2/tradingview-mcp-india/main/src/tradingview_mcp/coinlist/nse.txt';
+const HISTORY_KEY='sonicPulseBhavHistoryV2';
+const MAX_DAYS=40;
+let symbols=[], stopped=false, history=loadHistory();
+const scanBtn=document.getElementById('scan'), stopBtn=document.getElementById('stop');
+const statusEl=document.getElementById('status'), rowsEl=document.getElementById('rows');
+const fileInput=document.getElementById('bhavFile');
 
-let symbols = [];
-let stopped = false;
-let bhavFile = null;
+// Upgrade the single-file input into a multi-file history uploader.
+fileInput.multiple=true;
+fileInput.accept='.zip,.csv';
+fileInput.parentElement.childNodes[0].textContent='📦 NSE BhavCopy ZIP(s)';
 
-document.getElementById('bhavFile').addEventListener('change', e => {
-  bhavFile = e.target.files?.[0] || null;
-  statusEl.textContent = bhavFile
-    ? `BhavCopy selected • ${bhavFile.name} • Ready to scan`
-    : 'No BhavCopy selected';
+fileInput.addEventListener('change',async e=>{
+  const files=[...(e.target.files||[])];
+  if(!files.length){return;}
+  try{
+    await importFiles(files);
+    statusEl.textContent=`History ready • ${Object.keys(history).length} trading days stored • Tap Scan NIFTY 500`;
+  }catch(err){
+    console.error(err);
+    statusEl.textContent='Could not read one or more BhavCopy files. Please select NSE BhavCopy ZIP/CSV files.';
+  }
 });
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const scanBtn = document.getElementById('scan');
-const stopBtn = document.getElementById('stop');
-const statusEl = document.getElementById('status');
-const rowsEl = document.getElementById('rows');
-
-/* Load the NIFTY 500 universe.
-   The source file is specifically documented as containing 500 Nifty 500 symbols. */
-async function loadUniverse(){
-  // Primary source
-  let r = await fetch(UNIVERSE_URL, {cache:'no-store'});
-  if(!r.ok){
-    // Fallback to the known public repository path
-    r = await fetch(
-      'https://raw.githubusercontent.com/sswapnil2/tradingview-mcp-india/main/src/tradingview_mcp/coinlist/nse.txt',
-      {cache:'no-store'}
-    );
+// Add a clear-history button without changing the existing scanner layout.
+const clearBtn=document.createElement('button');
+clearBtn.textContent='Clear History';
+clearBtn.style.background='#64748b';
+clearBtn.onclick=()=>{
+  if(confirm('Delete all locally saved BhavCopy history?')){
+    history={}; saveHistory(); renderHistoryStatus(); rowsEl.innerHTML='<tr><td colspan="9" class="small">History cleared. Upload BhavCopy files.</td></tr>';
   }
-  if(!r.ok) throw new Error('NIFTY 500 list unavailable');
+};
+document.querySelector('.bar').appendChild(clearBtn);
 
-  const text = await r.text();
-  symbols = [...new Set(
-    text.split(/\s+/)
-      .map(x => x.trim())
-      .filter(x => x.startsWith('NSE:'))
-      .map(x => x.slice(4))
-  )];
-
-  if(symbols.length < 450) throw new Error('Invalid NIFTY 500 list');
-
-  statusEl.textContent =
-    `NIFTY 500 loaded • ${symbols.length} stocks • Tap Scan NIFTY 500`;
+function loadHistory(){
+  try{return JSON.parse(localStorage.getItem(HISTORY_KEY)||'{}')||{};}catch(e){return {};}
+}
+function saveHistory(){
+  try{
+    localStorage.setItem(HISTORY_KEY,JSON.stringify(history));
+  }catch(e){
+    statusEl.textContent='Browser storage is full. Clear old history and upload again.';
+  }
+}
+function renderHistoryStatus(){
+  const dates=Object.keys(history).sort();
+  statusEl.textContent=dates.length
+    ? `History ready • ${dates.length} trading days stored (${dates[0]} → ${dates.at(-1)}) • Tap Scan NIFTY 500`
+    : 'No BhavCopy history yet • Upload NSE BhavCopy ZIP(s)';
 }
 
-async function chart(sym){
-  const u =
-    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}.NS?range=3mo&interval=1d&events=history`;
-  const r = await fetch(u);
-  if(!r.ok) throw Error(r.status);
-  return r.json();
+function csvRows(text){
+  // Simple RFC4180-compatible parser; NSE BhavCopy fields do not contain unescaped newlines.
+  const lines=text.replace(/^\uFEFF/,'').split(/\r?\n/).filter(Boolean);
+  if(!lines.length) return [];
+  const parseLine=line=>{
+    const out=[]; let cur='', quote=false;
+    for(let i=0;i<line.length;i++){
+      const ch=line[i];
+      if(ch==='"'){
+        if(quote && line[i+1]==='"'){cur+='"';i++;}
+        else quote=!quote;
+      }else if(ch===',' && !quote){out.push(cur);cur='';}
+      else cur+=ch;
+    }
+    out.push(cur); return out;
+  };
+  const header=parseLine(lines[0]).map(x=>x.trim());
+  const idx={}; header.forEach((h,i)=>idx[h]=i);
+  const needed=['TradDt','TckrSymb','SctySrs','OpnPric','HghPric','LwPric','ClsPric','PrvsClsgPric','TtlTradgVol'];
+  if(needed.some(k=>idx[k]===undefined)) throw Error('Not an NSE CM BhavCopy file');
+  return lines.slice(1).map(line=>{
+    const a=parseLine(line);
+    return {
+      date:a[idx.TradDt], sym:a[idx.TckrSymb], series:a[idx.SctySrs],
+      open:Number(a[idx.OpnPric]), high:Number(a[idx.HghPric]), low:Number(a[idx.LwPric]),
+      close:Number(a[idx.ClsPric]), prev:Number(a[idx.PrvsClsgPric]), volume:Number(a[idx.TtlTradgVol])
+    };
+  }).filter(x=>x.date && x.sym && x.series==='EQ' && Number.isFinite(x.close) && Number.isFinite(x.high) && Number.isFinite(x.volume));
+}
+
+async function readFile(file){
+  const name=file.name.toLowerCase();
+  if(name.endsWith('.csv')) return csvRows(await file.text());
+  if(!window.JSZip) throw Error('ZIP reader not loaded. Check internet and reload the page.');
+  const zip=await JSZip.loadAsync(await file.arrayBuffer());
+  const csvName=Object.keys(zip.files).find(n=>n.toLowerCase().endsWith('.csv'));
+  if(!csvName) throw Error('CSV not found inside ZIP');
+  return csvRows(await zip.files[csvName].async('string'));
+}
+
+async function importFiles(files){
+  let imported=0;
+  for(let i=0;i<files.length;i++){
+    statusEl.textContent=`Reading BhavCopy ${i+1}/${files.length}…`;
+    const rows=await readFile(files[i]);
+    const byDate={};
+    for(const r of rows){
+      // Keep only the equity series needed by the scanner.
+      (byDate[r.date] ||= []).push(r);
+    }
+    for(const [date,arr] of Object.entries(byDate)){
+      const map={};
+      for(const r of arr) map[r.sym]=r;
+      history[date]=Object.values(map);
+      imported++;
+    }
+  }
+  // Retain the newest MAX_DAYS trading dates locally.
+  const dates=Object.keys(history).sort();
+  if(dates.length>MAX_DAYS){
+    for(const d of dates.slice(0,dates.length-MAX_DAYS)) delete history[d];
+  }
+  saveHistory(); renderHistoryStatus();
+}
+
+async function loadUniverse(){
+  let r=await fetch(UNIVERSE_URL,{cache:'no-store'});
+  if(!r.ok) r=await fetch(FALLBACK_UNIVERSE_URL,{cache:'no-store'});
+  if(!r.ok) throw Error('NIFTY 500 list unavailable');
+  const text=await r.text();
+  symbols=[...new Set(text.split(/\s+/).map(x=>x.trim()).filter(x=>x.startsWith('NSE:')).map(x=>x.slice(4)))];
+  if(symbols.length<450) throw Error('Invalid NIFTY 500 list');
+  renderHistoryStatus();
 }
 
 async function quoteCaps(list){
-  const out = {};
+  const out={};
   for(let i=0;i<list.length;i+=50){
-    const part = list.slice(i,i+50);
-    const u =
-      'https://query1.finance.yahoo.com/v7/finance/quote?symbols=' +
-      part.map(s => encodeURIComponent(s+'.NS')).join(',');
+    if(stopped) break;
+    const part=list.slice(i,i+50);
+    const u='https://query1.finance.yahoo.com/v7/finance/quote?symbols='+part.map(s=>encodeURIComponent(s+'.NS')).join(',');
     try{
-      const r = await fetch(u);
+      const r=await fetch(u,{cache:'no-store'});
       if(!r.ok) continue;
-      const j = await r.json();
-      for(const q of (j.quoteResponse?.result || [])){
-        out[q.symbol.replace('.NS','')] = q.marketCap || 0;
-      }
+      const j=await r.json();
+      for(const q of (j.quoteResponse?.result||[])) out[q.symbol.replace('.NS','')]=Number(q.marketCap||0);
     }catch(e){}
   }
   return out;
 }
 
-function rsi(a,n=9){
-  if(a.length<n+1) return null;
-  let g=0,l=0;
-  for(let i=a.length-n;i<a.length;i++){
-    const d=a[i]-a[i-1];
-    if(d>0) g+=d;
-    else l-=d;
+function rsi(values,n=9){
+  if(values.length<n+1) return null;
+  let gains=0,losses=0;
+  for(let i=values.length-n;i<values.length;i++){
+    const d=values[i]-values[i-1];
+    if(d>0) gains+=d; else losses-=d;
   }
-  if(l===0) return 100;
-  const rs=(g/n)/(l/n);
+  if(losses===0) return 100;
+  const rs=(gains/n)/(losses/n);
   return 100-100/(1+rs);
 }
 
-function calc(sym,j,cap){
-  const q=j.chart.result[0];
-  const z=q.indicators.quote[0];
-  const c=(z.close||[]).map(Number);
-  const v=(z.volume||[]).map(Number);
-  const h=(z.high||[]).map(Number);
+function buildSeries(sym,dates){
+  return dates.map(d=>{
+    const arr=history[d]||[];
+    return arr.find(x=>x.sym===sym)||null;
+  });
+}
 
-  const n=c.length-1;
-  if(n<22) return null;
-
-  const close=c[n];
-  const prev=c[n-1];
-  const yv=v[n-1];
-  const d2v=v[n-2];
-  const yh=h[n-1];
-  const y20=Math.max(...h.slice(n-21,n));
-  const rr=rsi(c,9);
-
+function calc(sym,dates,cap){
+  const series=buildSeries(sym,dates);
+  // Need current day + previous day + at least 20 previous highs for rule 1 and 9+1 closes for RSI.
+  if(series.length<22) return null;
+  const valid=series.every(Boolean);
+  if(!valid) return null;
+  const n=series.length-1, today=series[n], prev=series[n-1], two=series[n-2];
+  const prev20=series.slice(n-20,n).map(x=>x.high);
+  if(prev20.length<20) return null;
+  const max20=Math.max(...prev20);
+  const closeHistory=series.map(x=>x.close);
+  const rr=rsi(closeHistory,9);
   const rules=[
-    close>y20,
+    today.close>max20,
     cap>1500*1e7,
     rr!==null && rr>60,
-    yv<2*d2v,
-    close>prev*1.02,
-    close>yh,
-    close*yv>2000000000
+    prev.volume<two.volume,
+    today.close>prev.close*1.02,
+    today.close>prev.high,
+    today.close*today.volume>2000000000
   ];
-
-  return {
-    sym, close,
-    chg:(close/prev-1)*100,
-    vol:v[n],
-    cap,
-    rsi:rr,
-    y20,
-    pass:rules.every(Boolean)
-  };
+  return {sym,close:today.close,chg:today.prev?((today.close/today.prev)-1)*100:((today.close/prev.close)-1)*100,vol:today.volume,cap,rsi:rr,y20:max20,rules,pass:rules.every(Boolean)};
 }
 
 function render(rows){
-  rows.sort((a,b)=>
-    Number(b.pass)-Number(a.pass) || b.chg-a.chg
-  );
-
-  rowsEl.innerHTML = rows.map((x,i)=>`
-    <tr>
-      <td>${i+1}</td>
-      <td><b>${x.sym}</b></td>
-      <td>₹${x.close.toFixed(2)}</td>
-      <td>${x.chg.toFixed(2)}%</td>
-      <td>${Math.round(x.vol).toLocaleString()}</td>
-      <td>${x.cap ? '₹'+(x.cap/1e7).toFixed(0)+' Cr' : '—'}</td>
-      <td>${x.rsi!==null ? x.rsi.toFixed(1) : '—'}</td>
-      <td>₹${x.y20.toFixed(2)}</td>
-      <td class="${x.pass?'pass':'fail'}">${x.pass?'✓ PASS':'—'}</td>
-    </tr>
-  `).join('');
+  rows.sort((a,b)=>Number(b.pass)-Number(a.pass)||b.chg-a.chg);
+  rowsEl.innerHTML=rows.length?rows.map((x,i)=>`<tr>
+    <td>${i+1}</td><td><b>${x.sym}</b></td><td>₹${x.close.toFixed(2)}</td><td>${x.chg.toFixed(2)}%</td>
+    <td>${Math.round(x.vol).toLocaleString()}</td><td>${x.cap?'₹'+(x.cap/1e7).toFixed(0)+' Cr':'—'}</td>
+    <td>${x.rsi!==null?x.rsi.toFixed(1):'—'}</td><td>₹${x.y20.toFixed(2)}</td>
+    <td class="${x.pass?'pass':'fail'}">${x.pass?'✓ PASS':'—'}</td></tr>`).join('')
+    :'<tr><td colspan="9" class="small">No stocks could be calculated from the uploaded history.</td></tr>';
 }
 
 async function scan(){
-  if(!symbols.length){
-    statusEl.textContent='NIFTY 500 list is not loaded. Refresh the page and try again.';
-    return;
-  }
-
-  stopped=false;
-  scanBtn.disabled=true;
-  stopBtn.disabled=false;
-
+  const dates=Object.keys(history).sort();
+  if(!dates.length){statusEl.textContent='First upload NSE BhavCopy ZIP(s).';return;}
+  if(dates.length<22){statusEl.textContent=`Only ${dates.length} trading days stored. Upload at least 22 days (25 preferred).`;return;}
+  if(!symbols.length){statusEl.textContent='NIFTY 500 list is not loaded. Refresh the page.';return;}
+  stopped=false; scanBtn.disabled=true; stopBtn.disabled=false;
+  const useDates=dates.slice(-MAX_DAYS);
   statusEl.textContent='Loading market-cap data…';
   const caps=await quoteCaps(symbols);
-
   let rows=[];
-
   for(let i=0;i<symbols.length;i++){
     if(stopped) break;
-
     const s=symbols[i];
-    statusEl.innerHTML =
-      `Scanning <b>${i+1}/${symbols.length}</b>: <b>${s}</b>`;
-
-    try{
-      const x=calc(s,await chart(s),caps[s]||0);
-      if(x) rows.push(x);
-    }catch(e){}
-
+    statusEl.innerHTML=`Scanning <b>${i+1}/${symbols.length}</b>: <b>${s}</b> • ${useDates.length} days`;
+    try{const x=calc(s,useDates,caps[s]||0); if(x) rows.push(x);}catch(e){}
     if(i%8===7) render(rows);
-    await sleep(100);
+    await new Promise(r=>setTimeout(r,30));
   }
-
   render(rows);
-
-  scanBtn.disabled=false;
-  stopBtn.disabled=true;
-
-  statusEl.textContent =
-    stopped
-      ? `Scan stopped • ${rows.length} stocks processed`
-      : `Scan complete • ${symbols.length} NIFTY 500 stocks checked • ${rows.filter(x=>x.pass).length} passed all 7 rules`;
+  scanBtn.disabled=false; stopBtn.disabled=true;
+  statusEl.textContent=stopped
+    ? `Scan stopped • ${rows.length} stocks calculated`
+    : `Scan complete • ${symbols.length} NIFTY 500 stocks checked • ${rows.filter(x=>x.pass).length} passed all 7 rules`;
 }
 
 scanBtn.onclick=scan;
-stopBtn.onclick=()=>{
-  stopped=true;
-  statusEl.textContent='Stopping…';
-};
-
-loadUniverse().catch(e=>{
-  statusEl.textContent='Could not load NIFTY 500 list. Refresh and try again.';
-  rowsEl.innerHTML=
-    '<tr><td colspan="9" class="small">NIFTY 500 universe unavailable.</td></tr>';
-});
+stopBtn.onclick=()=>{stopped=true;statusEl.textContent='Stopping…';};
+loadUniverse().catch(e=>{statusEl.textContent='Could not load NIFTY 500 list. Refresh and try again.';rowsEl.innerHTML='<tr><td colspan="9" class="small">NIFTY 500 universe unavailable.</td></tr>';});
+renderHistoryStatus();
 </script>
 </body>
 </html>
