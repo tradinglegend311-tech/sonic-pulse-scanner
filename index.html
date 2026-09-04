@@ -35,11 +35,16 @@ th{background:#f8fafc}
 
 <div class="wrap">
   <div class="bar">
+    <label style="display:flex;align-items:center;gap:8px;padding:11px 14px;border:1px solid #dbe2ea;border-radius:10px;background:#fff;font-weight:700;font-size:12px">
+      📦 Today's BhavCopy ZIP
+      <input id="bhavFile" type="file" accept=".zip,.csv" style="max-width:180px">
+    </label>
     <button id="scan">Scan NIFTY 500</button>
     <button id="stop" disabled>Stop</button>
   </div>
 
   <div id="status" class="status">Loading NIFTY 500 universe…</div>
+  <div class="small">Upload the latest NSE BhavCopy ZIP above before scanning. Historical data will be retained by the scanner in the browser.</div>
 
   <div class="card">
     <div class="tablewrap">
@@ -76,6 +81,14 @@ const UNIVERSE_URL =
 
 let symbols = [];
 let stopped = false;
+let bhavFile = null;
+
+document.getElementById('bhavFile').addEventListener('change', e => {
+  bhavFile = e.target.files?.[0] || null;
+  statusEl.textContent = bhavFile
+    ? `BhavCopy selected • ${bhavFile.name} • Ready to scan`
+    : 'No BhavCopy selected';
+});
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const scanBtn = document.getElementById('scan');
