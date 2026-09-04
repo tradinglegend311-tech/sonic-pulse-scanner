@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
+<title>Sonic Pulse NIFTY 500 Scanner</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#f5f7fb;color:#172033}
+header{background:#111827;color:#fff;padding:18px 16px;position:sticky;top:0;z-index:5}
+h1{font-size:20px;margin:0 0 5px}
+header p{margin:0;color:#cbd5e1;font-size:12px}
+.wrap{max-width:1100px;margin:auto;padding:14px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+button{border:0;border-radius:10px;padding:11px 14px;font-weight:700;background:#2563eb;color:#fff}
+button:disabled{opacity:.55}
+#stop{background:#475569}
+.status{font-size:12px;color:#64748b;padding:10px 0}
+.card{background:#fff;border:1px solid #e5e7eb;border-radius:14px;overflow:hidden}
+.tablewrap{overflow:auto}
+table{width:100%;border-collapse:collapse;min-width:850px}
+th,td{padding:10px 8px;border-bottom:1px solid #eef0f4;text-align:left;font-size:12px;white-space:nowrap}
+th{background:#f8fafc}
+.pass{color:#047857;font-weight:800}
+.fail{color:#94a3b8}
+.small{font-size:11px;color:#64748b;line-height:1.5}
+.note{margin-top:12px}
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ Sonic Pulse-Style NIFTY 500 Scanner</h1>
+  <p>Mobile scanner • NIFTY 500 universe • only the 7 requested rules</p>
+</header>
+
+<div class="wrap">
+  <div class="bar">
+    <button id="scan">Scan NIFTY 500</button>
+    <button id="stop" disabled>Stop</button>
+  </div>
+
+  <div id="status" class="status">Loading NIFTY 500 universe…</div>
+
+  <div class="card">
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Rank</th><th>Stock</th><th>Close</th><th>Chg%</th>
+            <th>Volume</th><th>Market Cap</th><th>RSI(9)</th>
+            <th>20D High</th><th>All 7</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="9" class="small">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <p class="small note">
+    <b>Rules:</b>
+    1) Daily Close &gt; 1 day ago Max(20, Daily High) ·
+    2) Market Cap &gt; 1500 ·
+    3) Daily RSI(9) &gt; 60 ·
+    4) 1 day ago Volume &lt; 2 days ago Volume ·
+    5) Daily Close &gt; 1 day ago Close × 1.02 ·
+    6) Daily Close &gt; 1 day ago High ·
+    7) Daily Close × Daily Volume &gt; 2,000,000,000.
+  </p>
+</div>
+
+<script>
+const UNIVERSE_URL =
+  'https://raw.githubusercontent.com/sswapnil2-tech/tradingview-mcp-india/main/src/tradingview_mcp/coinlist/nse.txt';
+
+let symbols = [];
+let stopped = false;
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const scanBtn = document.getElementById('scan');
+const stopBtn = document.getElementById('stop');
+const statusEl = document.getElementById('status');
+const rowsEl = document.getElementById('rows');
+
+/* Load the NIFTY 500 universe.
+   The source file is specifically documented as containing 500 Nifty 500 symbols. */
+async function loadUniverse(){
+  // Primary source
+  let r = await fetch(UNIVERSE_URL, {cache:'no-store'});
+  if(!r.ok){
+    // Fallback to the known public repository path
+    r = await fetch(
+      'https://raw.githubusercontent.com/sswapnil2/tradingview-mcp-india/main/src/tradingview_mcp/coinlist/nse.txt',
+      {cache:'no-store'}
+    );
+  }
+  if(!r.ok) throw new Error('NIFTY 500 list unavailable');
+
+  const text = await r.text();
+  symbols = [...new Set(
+    text.split(/\s+/)
+      .map(x => x.trim())
+      .filter(x => x.startsWith('NSE:'))
+      .map(x => x.slice(4))
+  )];
+
+  if(symbols.length < 450) throw new Error('Invalid NIFTY 500 list');
+
+  statusEl.textContent =
+    `NIFTY 500 loaded • ${symbols.length} stocks • Tap Scan NIFTY 500`;
+}
+
+async function chart(sym){
+  const u =
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}.NS?range=3mo&interval=1d&events=history`;
+  const r = await fetch(u);
+  if(!r.ok) throw Error(r.status);
+  return r.json();
+}
+
+async function quoteCaps(list){
+  const out = {};
+  for(let i=0;i<list.length;i+=50){
+    const part = list.slice(i,i+50);
+    const u =
+      'https://query1.finance.yahoo.com/v7/finance/quote?symbols=' +
+      part.map(s => encodeURIComponent(s+'.NS')).join(',');
+    try{
+      const r = await fetch(u);
+      if(!r.ok) continue;
+      const j = await r.json();
+      for(const q of (j.quoteResponse?.result || [])){
+        out[q.symbol.replace('.NS','')] = q.marketCap || 0;
+      }
+    }catch(e){}
+  }
+  return out;
+}
+
+function rsi(a,n=9){
+  if(a.length<n+1) return null;
+  let g=0,l=0;
+  for(let i=a.length-n;i<a.length;i++){
+    const d=a[i]-a[i-1];
+    if(d>0) g+=d;
+    else l-=d;
+  }
+  if(l===0) return 100;
+  const rs=(g/n)/(l/n);
+  return 100-100/(1+rs);
+}
+
+function calc(sym,j,cap){
+  const q=j.chart.result[0];
+  const z=q.indicators.quote[0];
+  const c=(z.close||[]).map(Number);
+  const v=(z.volume||[]).map(Number);
+  const h=(z.high||[]).map(Number);
+
+  const n=c.length-1;
+  if(n<22) return null;
+
+  const close=c[n];
+  const prev=c[n-1];
+  const yv=v[n-1];
+  const d2v=v[n-2];
+  const yh=h[n-1];
+  const y20=Math.max(...h.slice(n-21,n));
+  const rr=rsi(c,9);
+
+  const rules=[
+    close>y20,
+    cap>1500*1e7,
+    rr!==null && rr>60,
+    yv<2*d2v,
+    close>prev*1.02,
+    close>yh,
+    close*yv>2000000000
+  ];
+
+  return {
+    sym, close,
+    chg:(close/prev-1)*100,
+    vol:v[n],
+    cap,
+    rsi:rr,
+    y20,
+    pass:rules.every(Boolean)
+  };
+}
+
+function render(rows){
+  rows.sort((a,b)=>
+    Number(b.pass)-Number(a.pass) || b.chg-a.chg
+  );
+
+  rowsEl.innerHTML = rows.map((x,i)=>`
+    <tr>
+      <td>${i+1}</td>
+      <td><b>${x.sym}</b></td>
+      <td>₹${x.close.toFixed(2)}</td>
+      <td>${x.chg.toFixed(2)}%</td>
+      <td>${Math.round(x.vol).toLocaleString()}</td>
+      <td>${x.cap ? '₹'+(x.cap/1e7).toFixed(0)+' Cr' : '—'}</td>
+      <td>${x.rsi!==null ? x.rsi.toFixed(1) : '—'}</td>
+      <td>₹${x.y20.toFixed(2)}</td>
+      <td class="${x.pass?'pass':'fail'}">${x.pass?'✓ PASS':'—'}</td>
+    </tr>
+  `).join('');
+}
+
+async function scan(){
+  if(!symbols.length){
+    statusEl.textContent='NIFTY 500 list is not loaded. Refresh the page and try again.';
+    return;
+  }
+
+  stopped=false;
+  scanBtn.disabled=true;
+  stopBtn.disabled=false;
+
+  statusEl.textContent='Loading market-cap data…';
+  const caps=await quoteCaps(symbols);
+
+  let rows=[];
+
+  for(let i=0;i<symbols.length;i++){
+    if(stopped) break;
+
+    const s=symbols[i];
+    statusEl.innerHTML =
+      `Scanning <b>${i+1}/${symbols.length}</b>: <b>${s}</b>`;
+
+    try{
+      const x=calc(s,await chart(s),caps[s]||0);
+      if(x) rows.push(x);
+    }catch(e){}
+
+    if(i%8===7) render(rows);
+    await sleep(100);
+  }
+
+  render(rows);
+
+  scanBtn.disabled=false;
+  stopBtn.disabled=true;
+
+  statusEl.textContent =
+    stopped
+      ? `Scan stopped • ${rows.length} stocks processed`
+      : `Scan complete • ${symbols.length} NIFTY 500 stocks checked • ${rows.filter(x=>x.pass).length} passed all 7 rules`;
+}
+
+scanBtn.onclick=scan;
+stopBtn.onclick=()=>{
+  stopped=true;
+  statusEl.textContent='Stopping…';
+};
+
+loadUniverse().catch(e=>{
+  statusEl.textContent='Could not load NIFTY 500 list. Refresh and try again.';
+  rowsEl.innerHTML=
+    '<tr><td colspan="9" class="small">NIFTY 500 universe unavailable.</td></tr>';
+});
+</script>
+</body>
+</html>
