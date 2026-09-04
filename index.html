@@ -37,14 +37,14 @@ th{background:#f8fafc}
   <div class="bar">
     <label style="display:flex;align-items:center;gap:8px;padding:11px 14px;border:1px solid #dbe2ea;border-radius:10px;background:#fff;font-weight:700;font-size:12px">
       📦 NSE BhavCopy ZIP(s)
-      <input id="bhavFile" type="file" accept=".zip,.csv" style="max-width:180px">
+      <input id="bhavFile" type="file" accept=".zip,.csv" multiple style="max-width:180px">
     </label>
-    <button id="scan">Scan NIFTY 500</button>
+    <label style="display:flex;align-items:center;gap:8px;padding:11px 14px;border:1px solid #dbe2ea;border-radius:10px;background:#fff;font-weight:700;font-size:12px">📊 Market Cap CSV <input id="capFile" type="file" accept=".csv" style="max-width:180px"></label><button id="scan">Scan NIFTY 500</button>
     <button id="stop" disabled>Stop</button>
   </div>
 
   <div id="status" class="status">Loading NIFTY 500 universe…</div>
-  <div class="small">Upload one or more NSE BhavCopy ZIPs. The scanner keeps the newest 40 trading days in this browser, so tomorrow you can upload only the new day.</div>
+  <div class="small">Upload NSE BhavCopy ZIP(s). Market Cap CSV is loaded once and retained in this browser. Tomorrow upload only the new BhavCopy ZIP.</div>
 
   <div class="card">
     <div class="tablewrap">
@@ -206,21 +206,60 @@ async function loadUniverse(){
   renderHistoryStatus();
 }
 
-async function quoteCaps(list){
+
+let marketCaps=loadMarketCaps();
+
+function loadMarketCaps(){
+  try{return JSON.parse(localStorage.getItem('sonicPulseMarketCapsV1')||'{}')||{};}catch(e){return {};}
+}
+function saveMarketCaps(){
+  try{localStorage.setItem('sonicPulseMarketCapsV1',JSON.stringify(marketCaps));}catch(e){}
+}
+function parseMarketCapCSV(text){
+  const lines=text.replace(/^\uFEFF/,'').split(/\r?\n/).filter(Boolean);
+  if(!lines.length) throw Error('Empty market-cap CSV');
+  const parseLine=line=>{
+    const out=[]; let cur='', quote=false;
+    for(let i=0;i<line.length;i++){
+      const ch=line[i];
+      if(ch==='"'){
+        if(quote && line[i+1]==='"'){cur+='"';i++;}
+        else quote=!quote;
+      }else if(ch===',' && !quote){out.push(cur);cur='';}
+      else cur+=ch;
+    }
+    out.push(cur); return out.map(x=>x.trim());
+  };
+  const header=parseLine(lines[0]);
+  const norm=x=>x.toLowerCase().replace(/[^a-z0-9]/g,'');
+  const idx={}; header.forEach((h,i)=>idx[norm(h)]=i);
+  const symIdx=idx.symbol ?? idx.tckrsymb ?? idx.tickersymbol ?? idx.tickersymbols;
+  const capIdx=idx.marketcap ?? idx.marketcapitalization ?? idx.mktcap ?? idx.mcap;
+  if(symIdx===undefined || capIdx===undefined) throw Error('CSV must contain Symbol and Market Cap columns');
   const out={};
-  for(let i=0;i<list.length;i+=50){
-    if(stopped) break;
-    const part=list.slice(i,i+50);
-    const u='https://query1.finance.yahoo.com/v7/finance/quote?symbols='+part.map(s=>encodeURIComponent(s+'.NS')).join(',');
-    try{
-      const r=await fetch(u,{cache:'no-store'});
-      if(!r.ok) continue;
-      const j=await r.json();
-      for(const q of (j.quoteResponse?.result||[])) out[q.symbol.replace('.NS','')]=Number(q.marketCap||0);
-    }catch(e){}
+  for(const line of lines.slice(1)){
+    const a=parseLine(line), sym=(a[symIdx]||'').toUpperCase().replace(/^NSE:/,'').replace(/\.NS$/,'');
+    if(!sym) continue;
+    let raw=(a[capIdx]||'').replace(/[₹,\s]/g,'');
+    let cap=Number(raw);
+    if(!Number.isFinite(cap)) continue;
+    // User CSV may be in ₹ crore; values below 1e7 are interpreted as crore.
+    if(cap>0 && cap<1e7) cap*=1e7;
+    out[sym]=cap;
   }
   return out;
 }
+document.getElementById('capFile').addEventListener('change',async e=>{
+  const f=e.target.files?.[0]; if(!f)return;
+  try{
+    marketCaps=parseMarketCapCSV(await f.text());
+    saveMarketCaps();
+    statusEl.textContent=`Market-cap data loaded • ${Object.keys(marketCaps).length} stocks • Tap Scan NIFTY 500`;
+  }catch(err){
+    statusEl.textContent='Could not read market-cap CSV. Use Symbol and Market Cap columns.';
+  }
+});
+
 
 function rsi(values,n=9){
   if(values.length<n+1) return null;
@@ -282,8 +321,8 @@ async function scan(){
   if(!symbols.length){statusEl.textContent='NIFTY 500 list is not loaded. Refresh the page.';return;}
   stopped=false; scanBtn.disabled=true; stopBtn.disabled=false;
   const useDates=dates.slice(-MAX_DAYS);
-  statusEl.textContent='Loading market-cap data…';
-  const caps=await quoteCaps(symbols);
+  const caps=marketCaps;
+  if(Object.keys(caps).length===0){statusEl.textContent='First upload Market Cap CSV, then scan.';scanBtn.disabled=false;stopBtn.disabled=true;return;}
   let rows=[];
   for(let i=0;i<symbols.length;i++){
     if(stopped) break;
