@@ -81,7 +81,8 @@ const UNIVERSE_URL='https://raw.githubusercontent.com/sswapnil2-tech/tradingview
 const FALLBACK_UNIVERSE_URL='https://raw.githubusercontent.com/sswapnil2/tradingview-mcp-india/main/src/tradingview_mcp/coinlist/nse.txt';
 const HISTORY_KEY='sonicPulseBhavHistoryV2';
 const MAX_DAYS=40;
-let symbols=[], stopped=false, history=loadHistory();
+const MARKET_CAP_KEY='sonicPulseMarketCapsV1';
+let symbols=[], stopped=false, history=loadHistory(), marketCaps=loadMarketCaps();
 const scanBtn=document.getElementById('scan'), stopBtn=document.getElementById('stop');
 const statusEl=document.getElementById('status'), rowsEl=document.getElementById('rows');
 const fileInput=document.getElementById('bhavFile');
@@ -114,45 +115,51 @@ clearBtn.onclick=()=>{
 };
 document.querySelector('.bar').appendChild(clearBtn);
 
-// Market-cap CSV download: fetch current market caps for the loaded NIFTY 500
-// universe and export them as Symbol,MarketCapCr.
+// Market-cap refresh/download helper. Market caps are fetched automatically
+// during Scan; this button is only for manually refreshing/exporting the latest
+// cached market-cap snapshot.
 const capBtn=document.createElement('button');
-capBtn.textContent='⬇ Download Market Cap CSV';
+capBtn.textContent='⬇ Market Cap CSV';
 capBtn.style.background='#0f766e';
 capBtn.onclick=async()=>{
-  if(!symbols.length){
-    statusEl.textContent='Load NIFTY 500 universe first.';
-    return;
-  }
+  if(!symbols.length){statusEl.textContent='NIFTY 500 list is still loading…';return;}
   capBtn.disabled=true;
-  statusEl.textContent='Fetching market caps…';
+  statusEl.textContent='Fetching current market caps automatically…';
   try{
     const caps=await quoteCaps(symbols);
+    if(Object.keys(caps).length<450) throw Error('Incomplete market-cap response');
     const lines=['Symbol,MarketCapCr'];
     for(const s of symbols){
       const v=Number(caps[s]);
-      if(Number.isFinite(v) && v>0) lines.push(`${s},${v}`);
+      if(Number.isFinite(v)&&v>0) lines.push(`${s},${(v/1e7).toFixed(2)}`);
     }
-    if(lines.length<2) throw Error('No market-cap data returned.');
     const blob=new Blob([lines.join('\n')+'\n'],{type:'text/csv;charset=utf-8'});
-    const a=document.createElement('a');
-    a.href=URL.createObjectURL(blob);
+    const a=document.createElement('a'); a.href=URL.createObjectURL(blob);
     a.download=`NIFTY500_MarketCap_${new Date().toISOString().slice(0,10)}.csv`;
     document.body.appendChild(a); a.click(); a.remove();
     setTimeout(()=>URL.revokeObjectURL(a.href),1000);
     statusEl.textContent=`Market Cap CSV ready • ${lines.length-1} stocks`;
   }catch(err){
     console.error(err);
-    statusEl.textContent='Could not fetch market-cap data. Try again.';
-  }finally{
-    capBtn.disabled=false;
-  }
+    statusEl.textContent='Automatic market-cap source unavailable. Scan can still use previously cached caps.';
+  }finally{capBtn.disabled=false;}
 };
 document.querySelector('.bar').appendChild(capBtn);
 
 function loadHistory(){
   try{return JSON.parse(localStorage.getItem(HISTORY_KEY)||'{}')||{};}catch(e){return {};}
 }
+function loadMarketCaps(){
+  try{
+    const x=JSON.parse(localStorage.getItem(MARKET_CAP_KEY)||'null');
+    if(x && x.date && x.caps) return x;
+  }catch(e){}
+  return {date:'',caps:{}};
+}
+function saveMarketCaps(){
+  try{localStorage.setItem(MARKET_CAP_KEY,JSON.stringify(marketCaps));}catch(e){}
+}
+
 function saveHistory(){
   try{
     localStorage.setItem(HISTORY_KEY,JSON.stringify(history));
@@ -242,58 +249,42 @@ async function loadUniverse(){
   renderHistoryStatus();
 }
 
-async function fetchTextWithProxy(url){
-  const proxies=[
-    'https://corsproxy.io/?url='+encodeURIComponent(url),
-    'https://api.allorigins.win/raw?url='+encodeURIComponent(url)
-  ];
-  for(const u of proxies){
-    try{
-      const r=await fetch(u,{cache:'no-store'});
-      if(r.ok){ const t=await r.text(); if(t && t.length>1000) return t; }
-    }catch(e){}
-  }
-  throw Error('Market-cap source unavailable');
-}
-
-async function screenerCaps(list){
-  const wanted=new Set(list);
+async function quoteCaps(list){
+  // Automatic market-cap source: TradingView's public India scanner.
+  // It returns market_cap_basic for NSE-listed securities in one/batched request,
+  // so the user does not need to download or upload a separate market-cap CSV.
+  const wanted=new Set(list.map(x=>String(x).toUpperCase()));
   const out={};
-  const pages=[...Array(20)].map((_,i)=>i+1);
-  for(let i=0;i<pages.length;i+=4){
-    const batch=pages.slice(i,i+4);
-    await Promise.all(batch.map(async page=>{
-      const url='https://www.screener.in/company/CNX500/?page='+page+'&order=asc&sort=name';
-      try{
-        const html=await fetchTextWithProxy(url);
-        const doc=new DOMParser().parseFromString(html,'text/html');
-        const rows=[...doc.querySelectorAll('table tbody tr')];
-        for(const tr of rows){
-          const a=tr.querySelector('a[href^="/company/"]');
-          const cells=[...tr.querySelectorAll('td')].map(x=>x.textContent.trim());
-          if(!a || cells.length<5) continue;
-          const m=a.getAttribute('href').match(/^\/company\/([^/]+)/);
-          if(!m) continue;
-          const sym=m[1].replace(/-consolidated$/,'');
-          if(!wanted.has(sym)) continue;
-          const capCr=parseFloat((cells[4]||'').replace(/[^0-9.\-]/g,''));
-          if(Number.isFinite(capCr) && capCr>0) out[sym]=capCr*1e7;
-        }
-      }catch(e){ console.warn('Screener page failed',page,e); }
-    }));
+  const endpoints=[
+    'https://scanner.tradingview.com/india/scan',
+    'https://scanner.tradingview.com/global/scan'
+  ];
+  const payload={
+    filter:[{left:'exchange',operation:'equal',right:'NSE'}],
+    options:{lang:'en'},
+    symbols:{query:{types:[]},tickers:[]},
+    columns:['name','market_cap_basic'],
+    range:[0,5000]
+  };
+  for(const endpoint of endpoints){
+    try{
+      const r=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),cache:'no-store'});
+      if(!r.ok) continue;
+      const data=await r.json();
+      const arr=Array.isArray(data.data)?data.data:[];
+      for(const row of arr){
+        const ticker=String(row.s||'').toUpperCase();
+        const sym=ticker.startsWith('NSE:')?ticker.slice(4):ticker;
+        const vals=row.d||[];
+        const cap=Number(vals[1]);
+        if(wanted.has(sym) && Number.isFinite(cap) && cap>0) out[sym]=cap;
+      }
+      if(Object.keys(out).length>=Math.min(450,list.length)) break;
+    }catch(e){ console.warn('Automatic market-cap source failed',endpoint,e); }
   }
   return out;
 }
 
-async function quoteCaps(list){
-  // Yahoo Finance often blocks browser-origin requests (CORS). Use the
-  // public Screener NIFTY 500 constituents as the browser-safe fallback.
-  try{
-    const caps=await screenerCaps(list);
-    if(Object.keys(caps).length>=Math.min(450,list.length)) return caps;
-  }catch(e){}
-  return {};
-}
 function rsi(values,n=9){
   if(values.length<n+1) return null;
   let gains=0,losses=0;
@@ -354,8 +345,17 @@ async function scan(){
   if(!symbols.length){statusEl.textContent='NIFTY 500 list is not loaded. Refresh the page.';return;}
   stopped=false; scanBtn.disabled=true; stopBtn.disabled=false;
   const useDates=dates.slice(-MAX_DAYS);
-  statusEl.textContent='Loading market-cap data…';
-  const caps=await quoteCaps(symbols);
+  statusEl.textContent='Updating market-cap data automatically…';
+  let caps=marketCaps.caps||{};
+  const capAge=marketCaps.date ? (Date.now()-new Date(marketCaps.date).getTime()) : Infinity;
+  if(capAge>20*60*60*1000 || Object.keys(caps).length<450){
+    const fresh=await quoteCaps(symbols);
+    if(Object.keys(fresh).length>=450){
+      caps=fresh;
+      marketCaps={date:new Date().toISOString(),caps};
+      saveMarketCaps();
+    }
+  }
   let rows=[];
   for(let i=0;i<symbols.length;i++){
     if(stopped) break;
