@@ -114,6 +114,42 @@ clearBtn.onclick=()=>{
 };
 document.querySelector('.bar').appendChild(clearBtn);
 
+// Market-cap CSV download: fetch current market caps for the loaded NIFTY 500
+// universe and export them as Symbol,MarketCapCr.
+const capBtn=document.createElement('button');
+capBtn.textContent='⬇ Download Market Cap CSV';
+capBtn.style.background='#0f766e';
+capBtn.onclick=async()=>{
+  if(!symbols.length){
+    statusEl.textContent='Load NIFTY 500 universe first.';
+    return;
+  }
+  capBtn.disabled=true;
+  statusEl.textContent='Fetching market caps…';
+  try{
+    const caps=await quoteCaps(symbols);
+    const lines=['Symbol,MarketCapCr'];
+    for(const s of symbols){
+      const v=Number(caps[s]);
+      if(Number.isFinite(v) && v>0) lines.push(`${s},${v}`);
+    }
+    if(lines.length<2) throw Error('No market-cap data returned.');
+    const blob=new Blob([lines.join('\n')+'\n'],{type:'text/csv;charset=utf-8'});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download=`NIFTY500_MarketCap_${new Date().toISOString().slice(0,10)}.csv`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+    statusEl.textContent=`Market Cap CSV ready • ${lines.length-1} stocks`;
+  }catch(err){
+    console.error(err);
+    statusEl.textContent='Could not fetch market-cap data. Try again.';
+  }finally{
+    capBtn.disabled=false;
+  }
+};
+document.querySelector('.bar').appendChild(capBtn);
+
 function loadHistory(){
   try{return JSON.parse(localStorage.getItem(HISTORY_KEY)||'{}')||{};}catch(e){return {};}
 }
@@ -206,22 +242,58 @@ async function loadUniverse(){
   renderHistoryStatus();
 }
 
-async function quoteCaps(list){
-  const out={};
-  for(let i=0;i<list.length;i+=50){
-    if(stopped) break;
-    const part=list.slice(i,i+50);
-    const u='https://query1.finance.yahoo.com/v7/finance/quote?symbols='+part.map(s=>encodeURIComponent(s+'.NS')).join(',');
+async function fetchTextWithProxy(url){
+  const proxies=[
+    'https://corsproxy.io/?url='+encodeURIComponent(url),
+    'https://api.allorigins.win/raw?url='+encodeURIComponent(url)
+  ];
+  for(const u of proxies){
     try{
       const r=await fetch(u,{cache:'no-store'});
-      if(!r.ok) continue;
-      const j=await r.json();
-      for(const q of (j.quoteResponse?.result||[])) out[q.symbol.replace('.NS','')]=Number(q.marketCap||0);
+      if(r.ok){ const t=await r.text(); if(t && t.length>1000) return t; }
     }catch(e){}
+  }
+  throw Error('Market-cap source unavailable');
+}
+
+async function screenerCaps(list){
+  const wanted=new Set(list);
+  const out={};
+  const pages=[...Array(20)].map((_,i)=>i+1);
+  for(let i=0;i<pages.length;i+=4){
+    const batch=pages.slice(i,i+4);
+    await Promise.all(batch.map(async page=>{
+      const url='https://www.screener.in/company/CNX500/?page='+page+'&order=asc&sort=name';
+      try{
+        const html=await fetchTextWithProxy(url);
+        const doc=new DOMParser().parseFromString(html,'text/html');
+        const rows=[...doc.querySelectorAll('table tbody tr')];
+        for(const tr of rows){
+          const a=tr.querySelector('a[href^="/company/"]');
+          const cells=[...tr.querySelectorAll('td')].map(x=>x.textContent.trim());
+          if(!a || cells.length<5) continue;
+          const m=a.getAttribute('href').match(/^\/company\/([^/]+)/);
+          if(!m) continue;
+          const sym=m[1].replace(/-consolidated$/,'');
+          if(!wanted.has(sym)) continue;
+          const capCr=parseFloat((cells[4]||'').replace(/[^0-9.\-]/g,''));
+          if(Number.isFinite(capCr) && capCr>0) out[sym]=capCr*1e7;
+        }
+      }catch(e){ console.warn('Screener page failed',page,e); }
+    }));
   }
   return out;
 }
 
+async function quoteCaps(list){
+  // Yahoo Finance often blocks browser-origin requests (CORS). Use the
+  // public Screener NIFTY 500 constituents as the browser-safe fallback.
+  try{
+    const caps=await screenerCaps(list);
+    if(Object.keys(caps).length>=Math.min(450,list.length)) return caps;
+  }catch(e){}
+  return {};
+}
 function rsi(values,n=9){
   if(values.length<n+1) return null;
   let gains=0,losses=0;
